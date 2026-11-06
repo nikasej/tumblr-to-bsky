@@ -2,7 +2,7 @@ name: daily-bluesky-post
 
 on:
   schedule:
-    - cron: "17 * * * *"   # checks hourly; posts once a day at a varying peak hour
+    - cron: "17 * * * *"   # checks hourly: one Day post a day at a varying peak hour, extras earlier
   workflow_dispatch:
     inputs:
       force:
@@ -23,21 +23,23 @@ jobs:
       - name: Is it time?
         id: due
         run: |
-          if [ "${{ inputs.force }}" = "true" ] || python3 tumblr_to_bsky.py due; then
-            echo "go=true" >> "$GITHUB_OUTPUT"
+          if [ "${{ inputs.force }}" = "true" ]; then
+            echo "action=auto" >> "$GITHUB_OUTPUT"
+          elif action=$(python3 tumblr_to_bsky.py due); then
+            echo "action=$action" >> "$GITHUB_OUTPUT"
           fi
-      - if: steps.due.outputs.go == 'true'
+      - if: steps.due.outputs.action != ''
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - if: steps.due.outputs.go == 'true'
+      - if: steps.due.outputs.action != ''
         run: pip install requests atproto pillow opencv-python-headless numpy
-      - if: steps.due.outputs.go == 'true'
-        run: python tumblr_to_bsky.py post
+      - if: steps.due.outputs.action != ''
+        run: python tumblr_to_bsky.py post ${{ steps.due.outputs.action }}
         env:
           BSKY_HANDLE: ${{ secrets.BSKY_HANDLE }}
           BSKY_APP_PASSWORD: ${{ secrets.BSKY_APP_PASSWORD }}
-      - if: steps.due.outputs.go == 'true'
+      - if: steps.due.outputs.action != ''
         name: Save progress
         run: |
           git config user.name "bsky-bot"

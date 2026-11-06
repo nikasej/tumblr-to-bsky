@@ -51,7 +51,11 @@ cards, n = [], 0
 while True:
     calls.clear()
     before = set(json.load(open("posted.json"))) if os.path.exists("posted.json") else set()
-    t.post_next()
+    buf = io.StringIO()
+    import contextlib
+    with contextlib.redirect_stdout(buf):
+        t.post_next()
+    kind = "add-on" if "Posted extra" in buf.getvalue() else "daily"
     if not calls:
         break
     n += 1
@@ -64,7 +68,7 @@ while True:
         block = f'<div class="{cls}">{g}</div>' if imgs else ""
         parts.append(f'<div class="post{" reply" if k else ""}"><div class="av"></div><div class="body"><div class="txt">{rich(tb)}</div>{block}</div></div>')
     s = "s" if len(calls) > 1 else ""
-    cards.append(f'<section><header><b>{n}</b><span>from Tumblr {d}</span><span class="cnt">{len(calls)} post{s}</span></header>{"".join(parts)}</section>')
+    cards.append(f'<section><header><b>{n}</b><span class="kind {kind}">{kind}</span><span>from Tumblr {d}</span><span class="cnt">{len(calls)} post{s}</span></header>{"".join(parts)}</section>')
 
 CSS = """:root{--bg:#f3f5f8;--card:#fff;--ink:#0b0f14;--mute:#6f7b88;--line:#e3e8ee;--acc:#1083fe;--av:#d9a3bd}
 @media (prefers-color-scheme:dark){:root{--bg:#0b0f14;--card:#161e27;--ink:#f1f3f5;--mute:#8b98a5;--line:#2a3541;--acc:#3d9bff;--av:#8a4e6c}}
@@ -74,7 +78,7 @@ h1{font-size:22px;margin:0 0 4px}.sub{color:var(--mute);margin:0 0 20px}
 section{background:var(--card);border:1px solid var(--line);border-radius:14px;margin:0 0 16px;overflow:hidden}
 header{display:flex;gap:10px;align-items:center;padding:10px 14px;border-bottom:1px solid var(--line);color:var(--mute);font-size:13px}
 header b{color:#fff;background:var(--acc);border-radius:999px;min-width:28px;text-align:center;padding:1px 8px;font-size:14px}
-.cnt{margin-left:auto}.post{display:flex;gap:10px;padding:12px 14px;position:relative}
+.cnt{margin-left:auto}.kind{font-weight:600;text-transform:uppercase;font-size:11px;letter-spacing:.04em;padding:1px 7px;border-radius:6px;background:var(--line);color:var(--ink)}.kind.add-on{background:#f5d0e3;color:#7a1d4d}.post{display:flex;gap:10px;padding:12px 14px;position:relative}
 .post.reply::before{content:"";position:absolute;left:33px;top:-12px;height:16px;border-left:2px solid var(--line)}
 .av{flex:0 0 40px;height:40px;border-radius:50%;background:var(--av)}
 .body{min-width:0;flex:1}.txt{overflow-wrap:anywhere}.tag{color:var(--acc)}
@@ -82,6 +86,6 @@ header b{color:#fff;background:var(--acc);border-radius:999px;min-width:28px;tex
 .imgs img{width:100%;border-radius:10px;display:block;border:1px solid var(--line)}"""
 OUT.write_text(f"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Bluesky Queue Preview</title><style>{CSS}</style></head><body><main><h1>Bluesky queue preview</h1>
-<p class="sub">{n} posts, one per day, oldest first. Images are shown exactly as they'll be uploaded, watermark included. Replies in a thread are stacked under their first post.</p>
+<p class="sub">{n} posts in posting order: one Day post a day in the evening; add-ons go out around midday the next day, before the following Day post, like on Tumblr. Images are shown exactly as they'll be uploaded, watermark included. Replies in a thread are stacked under their first post.</p>
 {"".join(cards)}</main></body></html>""")
 print(f"{n} posts -> {OUT}")

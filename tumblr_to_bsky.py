@@ -103,17 +103,31 @@ def export():
 
 
 # ---------- SCHEDULE ----------
-# The workflow wakes up every hour. Each day gets one posting time, picked at
-# random (but the same for every check that day) from the hours when art
-# posts on Bluesky are busiest. Activity per UTC hour is measured weekly by
-# tools/tag_stats.py; until then, typical EU-evening/US-afternoon hours are used.
-PEAK_HOURS = 6  # choose among this many busiest hours
-DEFAULT_ACTIVITY = {h: (3 if 14 <= h <= 21 else 1) for h in range(24)}
+# The workflow wakes up hourly. Times are planned in Berlin time, one Berlin
+# day at a time:
+#   - one daily post per day, at an hour picked at random (but fixed for the
+#     day) from the busiest Bluesky art hours that fall between 12:00 and 23:59
+#   - extras (non-"Day X" posts) go out the day after the Day post they
+#     followed on Tumblr, earlier in the day, so the order matches Tumblr:
+#     Day 4 in the evening, "born to be eepy" the next afternoon, then Day 5
+# Activity per UTC hour is measured weekly by tools/tag_stats.py.
+from zoneinfo import ZoneInfo
+
+TZ = ZoneInfo("Europe/Berlin")
+PEAK_HOURS = 6           # choose the daily hour among this many busiest hours
+DAILY_WINDOW = (12, 23)  # Berlin hours allowed for the daily post
+EXTRA_START = (11, 13)   # first extra of the day goes out in this hour range
+EXTRA_SPACING = (2, 3)   # hours between extras
+EXTRA_BEFORE_DAILY = 2   # extras stop this many hours before the daily post
+DEFAULT_ACTIVITY = {h: (3 if 14 <= h <= 21 else 1) for h in range(24)}  # UTC
 
 
-def todays_slot(today=None):
-    """(hour, minute) in UTC chosen for today's post."""
-    today = today or datetime.datetime.now(datetime.timezone.utc).date()
+def berlin_now():
+    return datetime.datetime.now(datetime.timezone.utc).astimezone(TZ)
+
+
+def todays_slot(day):
+    """Berlin hour of the daily post on `day` (a date)."""
     activity = dict(DEFAULT_ACTIVITY)
     if POPULARITY.exists():
         try:
@@ -122,31 +136,83 @@ def todays_slot(today=None):
                 activity = {int(h): n for h, n in hours.items()}
         except ValueError:
             pass
-    top = sorted(activity, key=activity.get, reverse=True)[:PEAK_HOURS]
-    rng = random.Random(today.isoformat())  # same pick all day
-    hour = rng.choices(top, weights=[activity[h] for h in top])[0]
-    return hour, rng.randrange(60)
+    noon = datetime.datetime(day.year, day.month, day.day, 12, tzinfo=TZ)
+    offset = int(noon.utcoffset().total_seconds() // 3600)
+    local = {(h + offset) % 24: n for h, n in activity.items()}
+    allowed = [h for h in local if DAILY_WINDOW[0] <= h <= DAILY_WINDOW[1]]
+    top = sorted(allowed, key=local.get, reverse=True)[:PEAK_HOURS]
+    rng = random.Random(f"daily-{day.isoformat()}")  # same pick all day
+    return rng.choices(top, weights=[local[h] for h in top])[0]
+
+
+DAY_RX = re.compile(r"^\s*day\s*\d+", re.I)
+EXTRA_GAP = (2, 4)  # extras go out this many hours after the previous post
+
+
+def is_day(m):
+    """True for 'Day X (old art) - ...' series posts; everything else is an extra."""
+    return bool(DAY_RX.match(m["text"]))
+
+
+def load_queue():
+    """Unposted, non-skipped image posts as (folder, meta), oldest first."""
+    posted = set(json.loads(STATE.read_text())) if STATE.exists() else set()
+    skip = set(json.loads(SKIP.read_text())) if SKIP.exists() else set()
+    q = []
+    for f in ARCHIVE.glob("*/post.json"):
+        m = json.loads(f.read_text())
+        # only posts with images; text-only posts are never reposted
+        if m["id"] not in posted and m["id"] not in skip and m["images"]:
+            q.append((f.parent, m))
+    return sorted(q, key=lambda x: x[1]["timestamp"])
+
+
+def load_state():
+    st = json.loads(LAST_POST.read_text()) if LAST_POST.exists() else {}
+    st.setdefault("pending", [])
+    return st
+
+
+def plan(now=None):
+    """What to post right now: 'extra', 'daily' or None, plus a reason."""
+    now = (now or berlin_now()).astimezone(TZ)
+    today = now.date().isoformat()
+    queue = load_queue()
+    if not queue:
+        return None, "Queue is empty."
+    st = load_state()
+    waiting = {m["id"] for _, m in queue}
+    pending = [i for i in st["pending"] if i in waiting]
+    daily_hour = todays_slot(now.date())
+    if st.get("date") == today:
+        return None, "Daily post already done today."
+
+    # extras queued by an earlier day's Day post go out before today's daily
+    if pending:
+        last = datetime.datetime.fromisoformat(st["last_time"]).astimezone(TZ) if st.get("last_time") else None
+        rng = random.Random(f"extra-{today}-{len(pending)}")
+        if last and last.date() == now.date():
+            next_hour = last.hour + rng.randint(*EXTRA_SPACING)
+        else:
+            next_hour = rng.randint(*EXTRA_START)
+        if next_hour <= daily_hour - EXTRA_BEFORE_DAILY:
+            if now.hour >= next_hour:
+                return "extra", f"Extra due ({next_hour:02d}:00 Berlin slot)."
+            return None, f"Next extra at {next_hour:02d}:00 Berlin, daily at {daily_hour:02d}:00."
+    if now.hour < daily_hour:
+        return None, f"Daily post today at {daily_hour:02d}:00 Berlin."
+    return "daily", f"Daily post due ({daily_hour:02d}:00 Berlin slot)."
 
 
 def due():
-    """Exit 0 if today's post should go out now, 1 otherwise (stdlib only)."""
-    now = datetime.datetime.now(datetime.timezone.utc)
-    if LAST_POST.exists() and json.loads(LAST_POST.read_text()).get("date") == now.date().isoformat():
-        print("Already posted today.")
-        return 1
-    posted = set(json.loads(STATE.read_text())) if STATE.exists() else set()
-    skip = set(json.loads(SKIP.read_text())) if SKIP.exists() else set()
-    waiting = [f for f in ARCHIVE.glob("*/post.json")
-               if f.parent.name not in posted | skip and json.loads(f.read_text())["images"]]
-    if not waiting:
-        print("Queue is empty.")
-        return 1
-    hour, minute = todays_slot(now.date())
-    if (now.hour, now.minute) < (hour, minute):
-        print(f"Not yet: today's slot is {hour:02d}:{minute:02d} UTC.")
-        return 1
-    print(f"Due: today's slot was {hour:02d}:{minute:02d} UTC.")
-    return 0
+    """Print the action to take now ('daily'/'extra') on stdout, exit 0;
+    exit 1 if nothing is due. Uses only the standard library."""
+    action, why = plan()
+    print(why, file=sys.stderr)
+    if action:
+        print(action)
+        return 0
+    return 1
 
 
 # ---------- POST ----------
@@ -419,22 +485,32 @@ def bsky_tags(tumblr_tags, caption=""):
     return ["art"] + out[: MAX_TAGS - 1]
 
 
-def post_next():
+def post_next(kind="auto"):
+    """Post one item. kind: 'daily', 'extra', or 'auto' (extra if one is
+    pending, else daily; used by the preview)."""
     from atproto import Client, client_utils, models
 
-    posted = set(json.loads(STATE.read_text())) if STATE.exists() else set()
-    # skip.json: list of Tumblr post ids that should never be posted
-    skip = set(json.loads(SKIP.read_text())) if SKIP.exists() else set()
-    queue = []
-    for f in ARCHIVE.glob("*/post.json"):
-        m = json.loads(f.read_text())
-        # only posts with images; text-only posts are never reposted
-        if m["id"] not in posted and m["id"] not in skip and m["images"]:
-            queue.append((m["timestamp"], f.parent, m))
+    queue = load_queue()
     if not queue:
         print("Nothing left to post.")
         return
-    _, folder, m = sorted(queue, key=lambda x: x[0])[0]  # oldest first
+    st = load_state()
+    byid = {m["id"]: (f, m) for f, m in queue}
+    pending = [i for i in st["pending"] if i in byid]
+    if kind == "auto":
+        kind = "extra" if pending else "daily"
+    if kind == "extra" and pending:
+        folder, m = byid[pending.pop(0)]
+    else:
+        kind = "daily"
+        days = [x for x in queue if is_day(x[1])]
+        folder, m = days[0] if days else queue[0]
+        if is_day(m):
+            # extras up to the next Day post belong to this one
+            later = [d[1]["timestamp"] for d in days[1:]]
+            cutoff = later[0] if later else float("inf")
+            pending += [x[1]["id"] for x in queue
+                        if not is_day(x[1]) and x[1]["timestamp"] < cutoff and x[1]["id"] not in pending]
 
     # "Day X (old art) - Month Year (age N)" header: always the opening line
     # of the first post, never split or dropped
@@ -486,10 +562,15 @@ def post_next():
         root = root or ref
         parent = ref
 
+    posted = set(json.loads(STATE.read_text())) if STATE.exists() else set()
     posted.add(m["id"])
     STATE.write_text(json.dumps(sorted(posted)))
-    LAST_POST.write_text(json.dumps({"date": datetime.datetime.now(datetime.timezone.utc).date().isoformat(), "id": m["id"]}))
-    print(f"Posted {m['id']} as {n} post(s)")
+    now = berlin_now()
+    if kind == "daily":
+        st["date"] = now.date().isoformat()
+    st.update(id=m["id"], last_time=now.isoformat(timespec="seconds"), pending=pending)
+    LAST_POST.write_text(json.dumps(st, indent=2))
+    print(f"Posted {kind} {m['id']} as {n} post(s)")
 
 
 if __name__ == "__main__":
@@ -497,13 +578,12 @@ if __name__ == "__main__":
     if cmd == "export":
         export()
     elif cmd == "post":
-        post_next()
+        post_next(sys.argv[2] if len(sys.argv) > 2 else "auto")
     elif cmd == "due":
         sys.exit(due())
-    elif cmd == "slots":  # show the next week's posting times
+    elif cmd == "slots":  # show the next week's daily posting hours
         for d in range(7):
-            day = datetime.date.today() + datetime.timedelta(days=d)
-            h, mi = todays_slot(day)
-            print(day, f"{h:02d}:{mi:02d} UTC")
+            day = berlin_now().date() + datetime.timedelta(days=d)
+            print(day, f"daily post at {todays_slot(day):02d}:xx Berlin")
     else:
         print("Usage: python tumblr_to_bsky.py [export|post|due|slots]")
