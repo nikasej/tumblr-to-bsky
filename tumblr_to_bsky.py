@@ -222,6 +222,62 @@ def split_text(text, limit=MAX_CHARS - 10):
     return chunks or [""]
 
 
+# ---------- TAGS ----------
+# Tumblr tags are never posted as-is. Each Bluesky tag below is only used when
+# one of the post's Tumblr tags matches its pattern, so a traditional piece can
+# never pick up e.g. #digitalart just because that tag is popular.
+# Groups are in priority order; within a group the more popular tag wins.
+# Popularity = Bluesky posts using the tag in the 7 days before 2026-11-06
+# (tools/tag_stats.py). Tags used by fewer than 50 posts/week are left out.
+TAG_RULES = [
+    # (group, bluesky tag, posts/week, regex matched against each Tumblr tag)
+    ("medium", "traditionalart", 1600, r"traditional"),
+    ("subject", "oc", 1600, r"^oc$|original character"),
+    ("subject", "fanart", 1600, r"fan ?art"),
+    ("fandom", "zelda", 1577, r"zelda|\bloz\b|^link fanart$"),
+    ("fandom", "anime", 1586, r"mirai nikki|yuno gasai|anime"),
+    ("fandom", "mlp", 1268, r"^mlp|my little pony"),
+    ("fandom", "genshinimpact", 936, r"genshin"),
+    ("fandom", "fnaf", 563, r"fnaf|five ?nights"),
+    ("technique", "sketch", 1597, r"sketch(es)?$|^sketch"),
+    ("technique", "characterdesign", 1432, r"design|ref(erence)? sheet"),
+    ("technique", "monochrome", 1266, r"monochrome"),
+    ("technique", "ink", 777, r"fineliner|ballpoint|\bpen\b|bic pen"),
+    ("technique", "sketchbook", 726, r"sketchbook"),
+    ("technique", "pencil", 243, r"^(?!.*colou?red).*pencil"),
+    ("technique", "coloredpencil", 104, r"colou?red pencil"),
+    ("theme", "wip", 1595, r"^wip$|work in progress"),
+    ("theme", "noai", 1484, r"fuck ai|no ?ai|human art"),
+    ("theme", "nostalgia", 454, r"nostalgia"),
+    ("theme", "zombie", 374, r"zombie"),
+    ("theme", "throwback", 220, r"^old art$"),
+    ("theme", "y2k", 158, r"y2k"),
+    ("theme", "refsheet", 107, r"ref(erence)? sheet"),
+    ("theme", "fairytale", 75, r"fairy ?tale|märchen|hänsel"),
+    ("theme", "ventart", 51, r"vent art"),
+]
+GROUP_ORDER = ["medium", "subject", "fandom", "technique", "theme"]
+MAX_TAGS = 5  # #art plus up to 4 specific tags
+
+
+def bsky_tags(tumblr_tags):
+    """Translate a post's Tumblr tags into a short list of popular Bluesky tags."""
+    src = [t.lower().strip() for t in tumblr_tags]
+    hits = {}
+    for group, tag, pop, rx in TAG_RULES:
+        if any(re.search(rx, t) for t in src):
+            hits[tag] = (GROUP_ORDER.index(group), -pop)
+    picked = sorted(hits, key=hits.get)
+    # one per group first so a post gets variety, then fill by priority
+    out, seen = [], set()
+    for tag in picked:
+        if hits[tag][0] not in seen:
+            out.append(tag)
+            seen.add(hits[tag][0])
+    out += [t for t in picked if t not in out]
+    return ["art"] + out[: MAX_TAGS - 1]
+
+
 def post_next():
     from atproto import Client, client_utils, models
 
@@ -268,8 +324,7 @@ def post_next():
         tb.text((chunk + label).strip())
         if i == n - 1:  # hashtags go on the last post if they fit
             used = len(chunk + label)
-            for t in m["tags"]:
-                tag = t.replace(" ", "").replace("#", "")
+            for tag in bsky_tags(m["tags"]):
                 if tag and used + len(tag) + 2 <= MAX_CHARS:
                     tb.text("\n" if used == len(chunk + label) else " ")
                     tb.tag(f"#{tag}", tag)
