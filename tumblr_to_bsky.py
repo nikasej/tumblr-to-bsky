@@ -18,19 +18,22 @@ import json
 import os
 import re
 import sys
+import datetime
+import random
 from pathlib import Path
-
-import requests
 
 ARCHIVE = Path("archive")
 STATE = Path("posted.json")
 SKIP = Path("skip.json")
+LAST_POST = Path("last_post.json")
 MAX_CHARS = 300          # Bluesky limit
 MAX_IMG_BYTES = 950_000  # Bluesky image limit is ~1MB
 
 
 # ---------- EXPORT ----------
 def export():
+    import requests
+
     # accept "name", "name.tumblr.com", "https://name.tumblr.com/",
     # "tumblr.com/name", "@name" etc.
     blog = os.environ["TUMBLR_BLOG"].strip().lower()
@@ -99,6 +102,53 @@ def export():
     print(f"Done. {saved} original posts archived in {ARCHIVE}/")
 
 
+# ---------- SCHEDULE ----------
+# The workflow wakes up every hour. Each day gets one posting time, picked at
+# random (but the same for every check that day) from the hours when art
+# posts on Bluesky are busiest. Activity per UTC hour is measured weekly by
+# tools/tag_stats.py; until then, typical EU-evening/US-afternoon hours are used.
+PEAK_HOURS = 6  # choose among this many busiest hours
+DEFAULT_ACTIVITY = {h: (3 if 14 <= h <= 21 else 1) for h in range(24)}
+
+
+def todays_slot(today=None):
+    """(hour, minute) in UTC chosen for today's post."""
+    today = today or datetime.datetime.now(datetime.timezone.utc).date()
+    activity = dict(DEFAULT_ACTIVITY)
+    if POPULARITY.exists():
+        try:
+            hours = json.loads(POPULARITY.read_text()).get("hours") or {}
+            if hours:
+                activity = {int(h): n for h, n in hours.items()}
+        except ValueError:
+            pass
+    top = sorted(activity, key=activity.get, reverse=True)[:PEAK_HOURS]
+    rng = random.Random(today.isoformat())  # same pick all day
+    hour = rng.choices(top, weights=[activity[h] for h in top])[0]
+    return hour, rng.randrange(60)
+
+
+def due():
+    """Exit 0 if today's post should go out now, 1 otherwise (stdlib only)."""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    if LAST_POST.exists() and json.loads(LAST_POST.read_text()).get("date") == now.date().isoformat():
+        print("Already posted today.")
+        return 1
+    posted = set(json.loads(STATE.read_text())) if STATE.exists() else set()
+    skip = set(json.loads(SKIP.read_text())) if SKIP.exists() else set()
+    waiting = [f for f in ARCHIVE.glob("*/post.json")
+               if f.parent.name not in posted | skip and json.loads(f.read_text())["images"]]
+    if not waiting:
+        print("Queue is empty.")
+        return 1
+    hour, minute = todays_slot(now.date())
+    if (now.hour, now.minute) < (hour, minute):
+        print(f"Not yet: today's slot is {hour:02d}:{minute:02d} UTC.")
+        return 1
+    print(f"Due: today's slot was {hour:02d}:{minute:02d} UTC.")
+    return 0
+
+
 # ---------- POST ----------
 WATERMARK = Path("watermark.png")
 WM_WIDTH = 0.18    # watermark width as a share of the image's shorter side
@@ -135,8 +185,76 @@ def has_watermark(img, wm) -> bool:
     return False
 
 
+WM_QUIET = 0.06    # max share of "busy" pixels allowed under the signature
+
+
+def busy_map(img):
+    """0..1 map of where something is drawn/written (edges, coloured marks,
+    dark pencil lines), computed at ~600px for speed. Returns (map, scale)."""
+    import cv2
+    import numpy as np
+
+    a = np.array(img.convert("RGB"))
+    h, w = a.shape[:2]
+    s = min(1.0, 600 / max(h, w))
+    a = cv2.resize(a, (max(1, int(w * s)), max(1, int(h * s))), interpolation=cv2.INTER_AREA)
+    g = cv2.cvtColor(a, cv2.COLOR_RGB2GRAY)
+    edges = cv2.Canny(cv2.GaussianBlur(g, (3, 3), 0), 30, 90) / 255.0
+    hsv = cv2.cvtColor(a, cv2.COLOR_RGB2HSV)
+    colour = ((hsv[..., 1] > 60) & (hsv[..., 2] > 40)).astype(float)
+    # faint pencil: anything noticeably darker than the paper around it
+    paper = cv2.medianBlur(g, 31).astype(int)
+    faint = ((paper - g.astype(int)) > 14).astype(float)
+    b = np.maximum(np.maximum(edges, faint), colour)
+    # a line "occupies" the space right around it too
+    k = max(5, int(min(h, w) * s / 60)) | 1
+    return cv2.dilate(b, np.ones((int(k), int(k)))), s
+
+
+def quiet_spot(img, wm_ratio):
+    """Pick where the signature goes: bottom-right if that's empty enough,
+    otherwise the emptiest spot, preferring places near bottom-right, and
+    trying smaller sizes before settling. Returns (x, y, width) in pixels."""
+    import cv2
+    import numpy as np
+
+    b, s = busy_map(img)
+    H, W = b.shape
+    short = min(H, W)
+    ii = cv2.integral(b)  # summed-area table: fast box sums
+
+    def score(x, y, w, h):
+        return (ii[y + h, x + w] - ii[y, x + w] - ii[y + h, x] + ii[y, x]) / (w * h)
+
+    best = None
+    for frac in (WM_WIDTH, WM_WIDTH * 0.8, WM_WIDTH * 0.65):
+        w = max(8, int(short * frac))
+        h = max(8, int(w * wm_ratio))
+        pad = max(1, int(short * WM_MARGIN))
+        if w + 2 * pad >= W or h + 2 * pad >= H:
+            continue
+        bx, by = W - w - pad, H - h - pad
+        if score(bx, by, w, h) <= WM_QUIET:
+            return int(bx / s), int(by / s), int(w / s)
+        step = max(2, short // 40)
+        for y in range(pad, H - h - pad + 1, step):
+            for x in range(pad, W - w - pad + 1, step):
+                # small penalty for drifting away from the bottom-right corner
+                drift = ((bx - x) / W + (by - y) / H) * 0.02
+                sc = score(x, y, w, h) + drift
+                if best is None or sc < best[0]:
+                    best = (sc, x, y, w)
+        if best and best[0] <= WM_QUIET:
+            break
+    if best is None:
+        return None
+    _, x, y, w = best
+    return int(x / s), int(y / s), int(w / s)
+
+
 def stamp(img):
-    """Add the signature bottom-right unless it's already in the image."""
+    """Add the signature unless it's already in the image: bottom-right when
+    that corner is empty, otherwise the nearest quiet spot."""
     from PIL import Image
 
     if not WATERMARK.exists():
@@ -149,12 +267,13 @@ def stamp(img):
     wm = wm.crop(wm.getchannel("A").getbbox())
     if has_watermark(img, wm):
         return img
-    short = min(img.size)
-    w = max(40, int(short * WM_WIDTH))
-    wm = wm.resize((w, int(w * wm.height / wm.width)), Image.LANCZOS)
-    pad = int(short * WM_MARGIN)
+    spot = quiet_spot(img, wm.height / wm.width)
+    if spot is None:
+        return img
+    x, y, w = spot
+    wm = wm.resize((w, max(1, int(w * wm.height / wm.width))), Image.LANCZOS)
     out = img.convert("RGBA")
-    out.alpha_composite(wm, (out.width - wm.width - pad, out.height - wm.height - pad))
+    out.alpha_composite(wm, (min(x, out.width - wm.width), min(y, out.height - wm.height)))
     return out.convert("RGB")
 
 
@@ -369,6 +488,7 @@ def post_next():
 
     posted.add(m["id"])
     STATE.write_text(json.dumps(sorted(posted)))
+    LAST_POST.write_text(json.dumps({"date": datetime.datetime.now(datetime.timezone.utc).date().isoformat(), "id": m["id"]}))
     print(f"Posted {m['id']} as {n} post(s)")
 
 
@@ -378,5 +498,12 @@ if __name__ == "__main__":
         export()
     elif cmd == "post":
         post_next()
+    elif cmd == "due":
+        sys.exit(due())
+    elif cmd == "slots":  # show the next week's posting times
+        for d in range(7):
+            day = datetime.date.today() + datetime.timedelta(days=d)
+            h, mi = todays_slot(day)
+            print(day, f"{h:02d}:{mi:02d} UTC")
     else:
-        print("Usage: python tumblr_to_bsky.py [export|post]")
+        print("Usage: python tumblr_to_bsky.py [export|post|due|slots]")

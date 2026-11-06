@@ -2,8 +2,13 @@ name: daily-bluesky-post
 
 on:
   schedule:
-    - cron: "0 16 * * *"   # every day 16:00 UTC; change to taste
-  workflow_dispatch:        # lets you trigger it manually to test
+    - cron: "17 * * * *"   # checks hourly; posts once a day at a varying peak hour
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Post now, ignoring today's time slot"
+        type: boolean
+        default: false
 
 permissions:
   contents: write           # needed to save posted.json back to the repo
@@ -15,18 +20,27 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Is it time?
+        id: due
+        run: |
+          if [ "${{ inputs.force }}" = "true" ] || python3 tumblr_to_bsky.py due; then
+            echo "go=true" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.due.outputs.go == 'true'
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install requests atproto pillow opencv-python-headless numpy
-      - run: git pull --ff-only
-      - run: python tumblr_to_bsky.py post
+      - if: steps.due.outputs.go == 'true'
+        run: pip install requests atproto pillow opencv-python-headless numpy
+      - if: steps.due.outputs.go == 'true'
+        run: python tumblr_to_bsky.py post
         env:
           BSKY_HANDLE: ${{ secrets.BSKY_HANDLE }}
           BSKY_APP_PASSWORD: ${{ secrets.BSKY_APP_PASSWORD }}
-      - name: Save progress
+      - if: steps.due.outputs.go == 'true'
+        name: Save progress
         run: |
           git config user.name "bsky-bot"
           git config user.email "bot@users.noreply.github.com"
-          git add posted.json
+          git add posted.json last_post.json
           git diff --cached --quiet || (git commit -m "update posted.json" && git push)
