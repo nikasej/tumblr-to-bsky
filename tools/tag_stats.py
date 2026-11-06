@@ -1,35 +1,35 @@
-"""Read-only: count how many Bluesky posts used each candidate tag in the last 7 days."""
-import datetime, os, sys
+"""Read-only: count Bluesky posts per candidate tag over the last 7 days and
+save them to tag_popularity.json, which the poster uses to rank tags."""
+import datetime, json, os, sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from atproto import Client
+from tumblr_to_bsky import TAG_RULES, POPULARITY
 
-TAGS = """art artsky myart artwork drawing illustration sketch sketchbook sketching doodle
-traditionalart traditionaldrawing pencil pencildrawing pencilsketch coloredpencil colouredpencil
-markers markerart alcoholmarkers copic fineliner ink inkdrawing penart ballpoint ballpointpen
-oc originalcharacter ocart characterdesign design fanart nostalgia 2010s oldart throwback
-artprogress artimprovement wip workinprogress fnaf fivenightsatfreddys fnaffanart mlp mylittlepony
-mlpfanart brony zelda legendofzelda zeldafanart skylanders tangled rapunzel disneyfanart markiplier
-yanderesimulator mirainikki yuno futurediary anime animeart animefanart genshin genshinimpact
-genshinfanart refsheet referencesheet zombie monochrome ventart fairytale humanart noai humanmade
-notai blinkies y2k pixelart sleepy dailysketch artjourney oldvsnew drawingprogress""".split()
-
+CAP = 2000  # stop counting past this; anything that high is "very popular"
 since = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
 c = Client()
 c.login(os.environ["BSKY_HANDLE"], os.environ["BSKY_APP_PASSWORD"])
-CAP = 1500
-rows = []
-for t in TAGS:
+
+old = json.loads(POPULARITY.read_text()).get("counts", {}) if POPULARITY.exists() else {}
+counts = {}
+for tag in sorted({r[1] for r in TAG_RULES}):
     n, cursor = 0, None
     try:
         while n < CAP:
-            r = c.app.bsky.feed.search_posts({"q": f"#{t}", "tag": [t], "since": since, "limit": 100, "cursor": cursor})
+            r = c.app.bsky.feed.search_posts({"q": f"#{tag}", "tag": [tag], "since": since, "limit": 100, "cursor": cursor})
             n += len(r.posts)
             cursor = r.cursor
             if not cursor or not r.posts:
                 break
-    except Exception as e:
-        print(f"{t}\tERR {e}", file=sys.stderr)
-    rows.append((n, t))
-    print(f"{t}\t{n}{'+' if n >= CAP else ''}", flush=True)
-print("\nSORTED")
-for n, t in sorted(rows, reverse=True):
-    print(f"{n}{'+' if n >= CAP else ''}\t#{t}")
+    except Exception as e:  # keep last week's number rather than a broken one
+        print(f"#{tag}: lookup failed ({e}), keeping previous value")
+        if tag in old:
+            counts[tag] = old[tag]
+        continue
+    counts[tag] = n
+    print(f"#{tag}: {n}{'+' if n >= CAP else ''}")
+
+POPULARITY.write_text(json.dumps({"measured": datetime.date.today().isoformat(), "counts": counts}, indent=2))
+print(f"saved {len(counts)} tags to {POPULARITY}")
