@@ -1,6 +1,7 @@
 # tumblr-to-bsky
 
-Reposts my original Tumblr posts to Bluesky, one per day, oldest first.
+Reposts my original Tumblr image posts to Bluesky, one per day, oldest first.
+Text-only posts, reblogs and asks are never posted. Add a post id to `skip.json` to exclude it.
 Long posts become numbered threads; images (max 4) go on the first post, tags on the last.
 
 ## Setup

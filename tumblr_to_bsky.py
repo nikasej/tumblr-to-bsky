@@ -24,6 +24,7 @@ import requests
 
 ARCHIVE = Path("archive")
 STATE = Path("posted.json")
+SKIP = Path("skip.json")
 MAX_CHARS = 300          # Bluesky limit
 MAX_IMG_BYTES = 950_000  # Bluesky image limit is ~1MB
 
@@ -64,7 +65,10 @@ def export():
             break
         for p in posts:
             offset += 1
-            if p.get("trail"):  # skip reblogs, keep only originals
+            # keep only your own originals: skip reblogs and answered asks
+            is_reblog = p.get("trail") or p.get("reblogged_from_id") or p.get("parent_post_url")
+            is_ask = any(l.get("type") == "ask" for l in p.get("layout", []))
+            if is_reblog or is_ask:
                 continue
             pid = str(p["id"])
             folder = ARCHIVE / pid
@@ -164,10 +168,13 @@ def post_next():
     from atproto import Client, client_utils, models
 
     posted = set(json.loads(STATE.read_text())) if STATE.exists() else set()
+    # skip.json: list of Tumblr post ids that should never be posted
+    skip = set(json.loads(SKIP.read_text())) if SKIP.exists() else set()
     queue = []
     for f in ARCHIVE.glob("*/post.json"):
         m = json.loads(f.read_text())
-        if m["id"] not in posted and (m["text"] or m["images"]):
+        # only posts with images; text-only posts are never reposted
+        if m["id"] not in posted and m["id"] not in skip and m["images"]:
             queue.append((m["timestamp"], f.parent, m))
     if not queue:
         print("Nothing left to post.")
