@@ -100,10 +100,68 @@ def export():
 
 
 # ---------- POST ----------
+WATERMARK = Path("watermark.png")
+WM_WIDTH = 0.18    # watermark width as a share of the image's shorter side
+WM_MARGIN = 0.025  # gap from the bottom-right edges, same unit
+WM_FOUND = 0.6     # match score above which the image counts as already signed
+
+
+def has_watermark(img, wm) -> bool:
+    """Look for the signature anywhere in the image, at any size, by
+    matching its silhouette against the pixels that share its pink colour."""
+    import cv2
+    import numpy as np
+
+    alpha = np.array(wm.getchannel("A"))
+    wm_hsv = cv2.cvtColor(np.array(wm.convert("RGB")), cv2.COLOR_RGB2HSV)[alpha > 200]
+    hue = int(np.median(wm_hsv[:, 0]))
+    hsv = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2HSV)
+    h = hsv[..., 0].astype(int)
+    dist = np.minimum(abs(h - hue), 180 - abs(h - hue))
+    mask = ((dist <= 12) & (hsv[..., 1] > 70) & (hsv[..., 2] > 70)).astype(np.uint8) * 255
+    if not mask.any():
+        return False
+    mask = cv2.GaussianBlur(mask, (3, 3), 0)
+    H, W = mask.shape
+    for frac in np.geomspace(0.04, 0.6, 30):
+        w = int(min(H, W) * frac)
+        h = int(w * alpha.shape[0] / alpha.shape[1])
+        if w < 16 or h >= H or w >= W:
+            continue
+        tpl = (cv2.resize(alpha, (w, h), interpolation=cv2.INTER_AREA) > 127).astype(np.uint8) * 255
+        score = np.nan_to_num(cv2.matchTemplate(mask, tpl, cv2.TM_CCOEFF_NORMED)).max()
+        if score >= WM_FOUND:
+            return True
+    return False
+
+
+def stamp(img):
+    """Add the signature bottom-right unless it's already in the image."""
+    from PIL import Image
+
+    if not WATERMARK.exists():
+        return img
+    # leave tiny or banner-shaped images (blinkies, buttons) alone:
+    # a signature would cover most of them
+    if min(img.size) < 200 or max(img.size) / min(img.size) > 3:
+        return img
+    wm = Image.open(WATERMARK).convert("RGBA")
+    wm = wm.crop(wm.getchannel("A").getbbox())
+    if has_watermark(img, wm):
+        return img
+    short = min(img.size)
+    w = max(40, int(short * WM_WIDTH))
+    wm = wm.resize((w, int(w * wm.height / wm.width)), Image.LANCZOS)
+    pad = int(short * WM_MARGIN)
+    out = img.convert("RGBA")
+    out.alpha_composite(wm, (out.width - wm.width - pad, out.height - wm.height - pad))
+    return out.convert("RGB")
+
+
 def shrink(path: Path) -> bytes:
     from PIL import Image
 
-    img = Image.open(path).convert("RGB")
+    img = stamp(Image.open(path).convert("RGB"))
     quality, scale = 90, 1.0
     while True:
         w, h = int(img.width * scale), int(img.height * scale)

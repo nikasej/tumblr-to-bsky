@@ -18,7 +18,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install requests atproto pillow
+      - run: pip install requests atproto pillow opencv-python-headless numpy
       - run: git pull --ff-only
       - run: python tumblr_to_bsky.py post
         env:
