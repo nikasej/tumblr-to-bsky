@@ -175,16 +175,19 @@ def post_next():
     _, folder, m = sorted(queue, key=lambda x: x[0])[0]  # oldest first
 
     chunks = split_text(m["text"])
+    # Bluesky allows 4 images per post: spread groups of 4 over the thread,
+    # adding image-only replies if there are more groups than text chunks
+    groups = [m["images"][k : k + 4] for k in range(0, len(m["images"]), 4)]
+    chunks += [""] * max(0, len(groups) - len(chunks))
     n = len(chunks)
     client = Client()
     client.login(os.environ["BSKY_HANDLE"], os.environ["BSKY_APP_PASSWORD"])
-    imgs = m["images"][:4]  # Bluesky max 4, attached to the first post
 
     root = parent = None
     for i, chunk in enumerate(chunks):
         label = f" {i + 1}/{n}" if n > 1 else ""
         tb = client_utils.TextBuilder()
-        tb.text(chunk + label)
+        tb.text((chunk + label).strip())
         if i == n - 1:  # hashtags go on the last post if they fit
             used = len(chunk + label)
             for t in m["tags"]:
@@ -196,11 +199,12 @@ def post_next():
         reply_to = (
             models.AppBskyFeedPost.ReplyRef(parent=parent, root=root) if parent else None
         )
-        if i == 0 and imgs:
+        if i < len(groups):
             resp = client.send_images(
                 tb,
-                images=[shrink(folder / im["file"]) for im in imgs],
-                image_alts=[im["alt"] for im in imgs],
+                images=[shrink(folder / im["file"]) for im in groups[i]],
+                image_alts=[im["alt"] for im in groups[i]],
+                reply_to=reply_to,
             )
         else:
             resp = client.send_post(tb, reply_to=reply_to)
