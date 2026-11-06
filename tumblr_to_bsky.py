@@ -30,8 +30,16 @@ MAX_IMG_BYTES = 950_000  # Bluesky image limit is ~1MB
 
 # ---------- EXPORT ----------
 def export():
-    blog = os.environ["TUMBLR_BLOG"]
-    key = os.environ["TUMBLR_API_KEY"]
+    # accept "name", "name.tumblr.com", "https://name.tumblr.com/",
+    # "tumblr.com/name", "@name" etc.
+    blog = os.environ["TUMBLR_BLOG"].strip().lower()
+    blog = re.sub(r"^https?://", "", blog).replace("www.", "").strip("/@ ")
+    if blog.startswith("tumblr.com/"):
+        blog = blog.split("/", 1)[1]
+    blog = blog.split("/")[0]
+    if "." not in blog:
+        blog += ".tumblr.com"
+    key = os.environ["TUMBLR_API_KEY"].strip()
     ARCHIVE.mkdir(exist_ok=True)
     offset, saved = 0, 0
     while True:
@@ -40,7 +48,17 @@ def export():
             params={"api_key": key, "npf": "true", "limit": 20, "offset": offset},
             timeout=30,
         )
-        r.raise_for_status()
+        if r.status_code != 200:
+            try:
+                msg = r.json().get("meta", {}).get("msg") or r.text[:200]
+            except ValueError:
+                msg = r.text[:200]
+            hint = {
+                401: "The API key was rejected. Check TUMBLR_API_KEY.",
+                404: "Blog not found. Check TUMBLR_BLOG (just the blog name is fine). "
+                "If the blog is hidden from logged-out visitors, the API can't see it.",
+            }.get(r.status_code, "")
+            sys.exit(f"Tumblr returned {r.status_code} ({msg}) for blog '{blog}'. {hint}")
         posts = r.json()["response"]["posts"]
         if not posts:
             break
