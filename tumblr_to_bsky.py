@@ -181,7 +181,20 @@ def post_next():
         return
     _, folder, m = sorted(queue, key=lambda x: x[0])[0]  # oldest first
 
-    chunks = split_text(m["text"])
+    # "Day X (old art) - Month Year (age N)" header: always the opening line
+    # of the first post, never split or dropped
+    text = m["text"].strip()
+    header, rest = "", text
+    first, _, after = text.partition("\n")
+    if re.match(r"^\s*day\s*\d+\b", first, re.I):
+        header, rest = first.strip(), after.strip()
+    chunks = split_text(rest) if rest else [""]
+    if header:
+        joined = f"{header}\n\n{chunks[0]}".strip()
+        if len(joined) <= MAX_CHARS - 10:
+            chunks[0] = joined
+        else:  # header gets the first post to itself
+            chunks.insert(0, header)
     # Bluesky allows 4 images per post: spread groups of 4 over the thread,
     # adding image-only replies if there are more groups than text chunks
     groups = [m["images"][k : k + 4] for k in range(0, len(m["images"]), 4)]
