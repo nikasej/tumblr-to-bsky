@@ -82,7 +82,7 @@ while True:
         cls = "imgs one" if len(imgs) == 1 else "imgs"
         block = f'<div class="{cls}">{g}</div>' if imgs else ""
         if k == 0 and meta[pid].get("reblog_of"):
-            title = html.escape((orig.get("text") or "your earlier post").strip().split("\\n")[0][:80])
+            title = html.escape((orig.get("text") or "your earlier post").strip().split("\n")[0][:80])
             block += f'<div class="quote">↪ quotes your Bluesky post: <b>{title}</b></div>' 
         parts.append(f'<div class="post{" reply" if k else ""}"><div class="av"></div><div class="body"><div class="txt">{rich(tb)}</div>{block}</div></div>')
     s = "s" if len(calls) > 1 else ""
