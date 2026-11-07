@@ -26,6 +26,7 @@ ARCHIVE = Path("archive")
 STATE = Path("posted.json")
 SKIP = Path("skip.json")
 LAST_POST = Path("last_post.json")
+BSKY_POSTS = Path("bsky_posts.json")  # Tumblr id -> Bluesky post it became
 MAX_CHARS = 300          # Bluesky limit
 MAX_IMG_BYTES = 950_000  # Bluesky image limit is ~1MB
 
@@ -63,15 +64,30 @@ def export():
                 "If the blog is hidden from logged-out visitors, the API can't see it.",
             }.get(r.status_code, "")
             sys.exit(f"Tumblr returned {r.status_code} ({msg}) for blog '{blog}'. {hint}")
-        posts = r.json()["response"]["posts"]
+        resp = r.json()["response"]
+        posts = resp["posts"]
+        me = (resp.get("blog") or {}).get("name", "").lower()
         if not posts:
             break
         for p in posts:
             offset += 1
-            # keep only your own originals: skip reblogs and answered asks
+            # keep your own originals, plus reblogs of your own posts (those
+            # become quote posts of the original on Bluesky); skip other
+            # people's posts you reblogged and answered asks
             is_reblog = p.get("trail") or p.get("reblogged_from_id") or p.get("parent_post_url")
             is_ask = any(l.get("type") == "ask" for l in p.get("layout", []))
-            if is_reblog or is_ask:
+            reblog_of = None
+            if is_reblog:
+                trail = p.get("trail") or [{}]
+                root_blog = ((trail[0].get("blog") or {}).get("name")
+                             or p.get("reblogged_root_name") or "").lower()
+                root_id = str((trail[0].get("post") or {}).get("id")
+                              or p.get("reblogged_root_id") or "")
+                if me and root_blog == me and root_id:
+                    reblog_of = root_id
+                else:
+                    continue
+            if is_ask:
                 continue
             pid = str(p["id"])
             folder = ARCHIVE / pid
@@ -95,6 +111,7 @@ def export():
                 "tags": p.get("tags", []),
                 "images": images,
                 "source": p.get("post_url"),
+                "reblog_of": reblog_of,  # Tumblr id of your own post this reblogs
             }
             (folder / "post.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False))
             saved += 1
@@ -485,6 +502,69 @@ def bsky_tags(tumblr_tags, caption=""):
     return ["art"] + out[: MAX_TAGS - 1]
 
 
+# ---------- SELF-REBLOGS ----------
+# A Tumblr reblog of your own post (usually with a new drawing added) becomes
+# a Bluesky quote post of the post the original turned into, so it reads as
+# "here's an update to this". If the original never made it to Bluesky
+# (text-only, skipped, or can't be found) it's posted as a normal post.
+
+
+def remember(tumblr_id, ref):
+    links = json.loads(BSKY_POSTS.read_text()) if BSKY_POSTS.exists() else {}
+    links[tumblr_id] = {"uri": ref.uri, "cid": ref.cid}
+    BSKY_POSTS.write_text(json.dumps(links, indent=2))
+
+
+def original_ref(client, tumblr_id):
+    """Strong ref to the Bluesky post made from Tumblr post `tumblr_id`, or None."""
+    from atproto import models
+
+    links = json.loads(BSKY_POSTS.read_text()) if BSKY_POSTS.exists() else {}
+    if tumblr_id in links:
+        return models.ComAtprotoRepoStrongRef.Main(**links[tumblr_id])
+    posted = set(json.loads(STATE.read_text())) if STATE.exists() else set()
+    f = ARCHIVE / tumblr_id / "post.json"
+    if tumblr_id not in posted or not f.exists():
+        return None
+    # posted before links were saved: find it on the profile by its opening text
+    opening = json.loads(f.read_text())["text"].strip().split("\n")[0][:60].strip()
+    if not opening:
+        return None
+    cursor = None
+    for _ in range(10):  # up to ~1000 recent posts
+        feed = client.get_author_feed(actor=os.environ["BSKY_HANDLE"], cursor=cursor,
+                                      filter="posts_no_replies", limit=100)
+        for item in feed.feed:
+            rec = item.post.record
+            if getattr(rec, "reply", None) is None and (rec.text or "").startswith(opening):
+                ref = models.ComAtprotoRepoStrongRef.Main(uri=item.post.uri, cid=item.post.cid)
+                remember(tumblr_id, ref)
+                return ref
+        cursor = feed.cursor
+        if not cursor:
+            break
+    return None
+
+
+def send(client, tb, images=(), alts=(), reply_to=None, quote=None):
+    """Post text with up to 4 images, optionally as a reply and/or quoting a post."""
+    from atproto import models
+
+    if quote is None:
+        if images:
+            return client.send_images(tb, images=list(images), image_alts=list(alts), reply_to=reply_to)
+        return client.send_post(tb, reply_to=reply_to)
+    record = models.AppBskyEmbedRecord.Main(record=quote)
+    if images:
+        imgs = [models.AppBskyEmbedImages.Image(alt=a or "", image=client.upload_blob(b).blob)
+                for b, a in zip(images, alts)]
+        embed = models.AppBskyEmbedRecordWithMedia.Main(
+            record=record, media=models.AppBskyEmbedImages.Main(images=imgs))
+    else:
+        embed = record
+    return client.send_post(tb, reply_to=reply_to, embed=embed)
+
+
 def post_next(kind="auto"):
     """Post one item. kind: 'daily', 'extra', or 'auto' (extra if one is
     pending, else daily; used by the preview)."""
@@ -534,6 +614,7 @@ def post_next(kind="auto"):
     client = Client()
     client.login(os.environ["BSKY_HANDLE"], os.environ["BSKY_APP_PASSWORD"])
 
+    quote = original_ref(client, m["reblog_of"]) if m.get("reblog_of") else None
     root = parent = None
     for i, chunk in enumerate(chunks):
         label = f" {i + 1}/{n}" if n > 1 else ""
@@ -549,19 +630,17 @@ def post_next(kind="auto"):
         reply_to = (
             models.AppBskyFeedPost.ReplyRef(parent=parent, root=root) if parent else None
         )
-        if i < len(groups):
-            resp = client.send_images(
-                tb,
-                images=[shrink(folder / im["file"]) for im in groups[i]],
-                image_alts=[im["alt"] for im in groups[i]],
-                reply_to=reply_to,
-            )
-        else:
-            resp = client.send_post(tb, reply_to=reply_to)
+        group = groups[i] if i < len(groups) else []
+        resp = send(client, tb,
+                    images=[shrink(folder / im["file"]) for im in group],
+                    alts=[im["alt"] for im in group],
+                    reply_to=reply_to,
+                    quote=quote if i == 0 else None)
         ref = models.create_strong_ref(resp)
         root = root or ref
         parent = ref
 
+    remember(m["id"], root)
     posted = set(json.loads(STATE.read_text())) if STATE.exists() else set()
     posted.add(m["id"])
     STATE.write_text(json.dumps(sorted(posted)))
@@ -570,7 +649,7 @@ def post_next(kind="auto"):
         st["date"] = now.date().isoformat()
     st.update(id=m["id"], last_time=now.isoformat(timespec="seconds"), pending=pending)
     LAST_POST.write_text(json.dumps(st, indent=2))
-    print(f"Posted {kind} {m['id']} as {n} post(s)")
+    print(f"Posted {kind} {m['id']} as {n} post(s)" + (" quoting the original" if quote else ""))
 
 
 if __name__ == "__main__":

@@ -22,15 +22,29 @@ from atproto import models
 from PIL import Image
 import tumblr_to_bsky as t
 
-calls = []
+import types
+from atproto_client.models.blob_ref import BlobRef, IpldLink
+CID = "bafyreib2rxk3rh6kzwq4yqx7vuxkqcv7xwb4mgyrqhqo2yqk5x5tq2hspe"
+calls, uploads, quotes = [], [], {}
 class _R:
-    def __init__(s, i): s.uri, s.cid = f"at://preview/{i}", "b"
+    def __init__(s, i): s.uri, s.cid = f"at://preview/{i}", CID
 class _Fake:
     def login(s, *a): pass
-    def send_post(s, tb, reply_to=None): calls.append((tb, [])); return _R(len(calls))
+    def upload_blob(s, b):
+        uploads.append(b)
+        return types.SimpleNamespace(blob=BlobRef(mime_type="image/jpeg", size=len(b), ref=IpldLink(link=CID)))
+    def send_post(s, tb, reply_to=None, embed=None):
+        imgs = list(uploads); uploads.clear()
+        if embed is not None:
+            rec = getattr(embed, "record", None)
+            rec = getattr(rec, "record", rec)
+            quotes[len(calls)] = getattr(rec, "uri", "")
+        calls.append((tb, imgs)); return _R(len(calls))
     def send_images(s, tb, images, image_alts=None, reply_to=None): calls.append((tb, images)); return _R(len(calls))
+    def get_author_feed(s, actor, cursor=None, filter=None, limit=None):
+        return types.SimpleNamespace(feed=[], cursor=None)
 atproto.Client = _Fake
-models.create_strong_ref = lambda r: models.ComAtprotoRepoStrongRef.Main(uri=r.uri, cid="bafyreib2rxk3rh6kzwq")
+models.create_strong_ref = lambda r: models.ComAtprotoRepoStrongRef.Main(uri=r.uri, cid=CID)
 
 meta = {json.load(open(f))["id"]: json.load(open(f)) for f in glob.glob("archive/*/post.json")}
 
@@ -49,7 +63,7 @@ def rich(tb):
 
 cards, n = [], 0
 while True:
-    calls.clear()
+    calls.clear(); quotes.clear()
     before = set(json.load(open("posted.json"))) if os.path.exists("posted.json") else set()
     buf = io.StringIO()
     import contextlib
@@ -62,10 +76,14 @@ while True:
     pid = (set(json.load(open("posted.json"))) - before).pop()
     d = datetime.date.fromtimestamp(meta[pid]["timestamp"]).strftime("%d %b %Y")
     parts = []
+    orig = meta.get(meta[pid].get("reblog_of") or "", {})
     for k, (tb, imgs) in enumerate(calls):
         g = "".join(f'<img src="data:image/jpeg;base64,{thumb(b)}" alt="">' for b in imgs)
         cls = "imgs one" if len(imgs) == 1 else "imgs"
         block = f'<div class="{cls}">{g}</div>' if imgs else ""
+        if k == 0 and meta[pid].get("reblog_of"):
+            title = html.escape((orig.get("text") or "your earlier post").strip().split("\\n")[0][:80])
+            block += f'<div class="quote">↪ quotes your Bluesky post: <b>{title}</b></div>' 
         parts.append(f'<div class="post{" reply" if k else ""}"><div class="av"></div><div class="body"><div class="txt">{rich(tb)}</div>{block}</div></div>')
     s = "s" if len(calls) > 1 else ""
     cards.append(f'<section><header><b>{n}</b><span class="kind {kind}">{kind}</span><span>from Tumblr {d}</span><span class="cnt">{len(calls)} post{s}</span></header>{"".join(parts)}</section>')
@@ -83,6 +101,7 @@ header b{color:#fff;background:var(--acc);border-radius:999px;min-width:28px;tex
 .av{flex:0 0 40px;height:40px;border-radius:50%;background:var(--av)}
 .body{min-width:0;flex:1}.txt{overflow-wrap:anywhere}.tag{color:var(--acc)}
 .imgs{display:grid;grid-template-columns:1fr 1fr;gap:4px;margin-top:8px}.imgs.one{grid-template-columns:1fr}
+.quote{margin-top:8px;border:1px solid var(--line);border-radius:10px;padding:8px 10px;font-size:13px;color:var(--mute)}.quote b{color:var(--ink);font-weight:600}
 .imgs img{width:100%;border-radius:10px;display:block;border:1px solid var(--line)}"""
 OUT.write_text(f"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Bluesky Queue Preview</title><style>{CSS}</style></head><body><main><h1>Bluesky queue preview</h1>

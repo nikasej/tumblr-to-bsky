@@ -33,7 +33,7 @@ jobs:
         with:
           python-version: "3.12"
       - if: steps.due.outputs.action != ''
-        run: pip install requests atproto pillow opencv-python-headless numpy
+        run: pip install requests atproto==0.0.73 pillow opencv-python-headless numpy
       - if: steps.due.outputs.action != ''
         run: python tumblr_to_bsky.py post ${{ steps.due.outputs.action }}
         env:
@@ -44,5 +44,5 @@ jobs:
         run: |
           git config user.name "bsky-bot"
           git config user.email "bot@users.noreply.github.com"
-          git add posted.json last_post.json
+          git add posted.json last_post.json bsky_posts.json
           git diff --cached --quiet || (git commit -m "update posted.json" && git push)
