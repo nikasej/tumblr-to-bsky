@@ -436,6 +436,7 @@ def split_text(text, limit=MAX_CHARS - 10):
 TAG_RULES = [
     # (group, bluesky tag, fallback posts/week, regex on Tumblr tags, regex on caption or None)
     ("medium", "traditionalart", 1600, r"traditional", None),
+    ("medium", "digitalart", 1000, r"^digital", r"\bdigital (art|version|drawing|painting|piece)\b"),
     ("subject", "oc", 1600, r"^oc$|original character", None),
     ("subject", "fanart", 1600, r"fan ?art", None),
     ("fandom", "zelda", 1577, r"zelda|\bloz\b|^link fanart$", None),
