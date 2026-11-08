@@ -61,15 +61,25 @@ def rich(tb):
     out.append(html.escape(bt[pos:].decode()))
     return "".join(out).replace("\n", "<br>")
 
+# step a fake clock hour by hour through the real schedule
+import contextlib
+clock = [datetime.datetime.now(datetime.timezone.utc).replace(minute=17, second=0, microsecond=0)]
+t.berlin_now = lambda: clock[0].astimezone(t.TZ)
 cards, n = [], 0
-while True:
+for _ in range(24 * 120):
+    action, _why = t.plan()
+    if not action:
+        if not t.load_queue():
+            break
+        clock[0] += datetime.timedelta(hours=1)
+        continue
     calls.clear(); quotes.clear()
     before = set(json.load(open("posted.json"))) if os.path.exists("posted.json") else set()
-    buf = io.StringIO()
-    import contextlib
-    with contextlib.redirect_stdout(buf):
-        t.post_next()
-    kind = "add-on" if "Posted extra" in buf.getvalue() else "daily"
+    with contextlib.redirect_stdout(io.StringIO()):
+        t.post_next(action)
+    kind = "add-on" if action == "extra" else "daily"
+    when = t.berlin_now().strftime("%a %d %b, %H:%M")
+    clock[0] += datetime.timedelta(hours=1)
     if not calls:
         break
     n += 1
@@ -86,7 +96,7 @@ while True:
             block += f'<div class="quote">↪ quotes your Bluesky post: <b>{title}</b></div>' 
         parts.append(f'<div class="post{" reply" if k else ""}"><div class="av"></div><div class="body"><div class="txt">{rich(tb)}</div>{block}</div></div>')
     s = "s" if len(calls) > 1 else ""
-    cards.append(f'<section><header><b>{n}</b><span class="kind {kind}">{kind}</span><span>from Tumblr {d}</span><span class="cnt">{len(calls)} post{s}</span></header>{"".join(parts)}</section>')
+    cards.append(f'<section><header><b>{n}</b><span class="kind {kind}">{kind}</span><span>{when}</span><span class="cnt">{len(calls)} post{s}</span></header>{"".join(parts)}</section>')
 
 CSS = """:root{--bg:#f3f5f8;--card:#fff;--ink:#0b0f14;--mute:#6f7b88;--line:#e3e8ee;--acc:#1083fe;--av:#d9a3bd}
 @media (prefers-color-scheme:dark){:root{--bg:#0b0f14;--card:#161e27;--ink:#f1f3f5;--mute:#8b98a5;--line:#2a3541;--acc:#3d9bff;--av:#8a4e6c}}
@@ -105,6 +115,6 @@ header b{color:#fff;background:var(--acc);border-radius:999px;min-width:28px;tex
 .imgs img{width:100%;border-radius:10px;display:block;border:1px solid var(--line)}"""
 OUT.write_text(f"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Bluesky Queue Preview</title><style>{CSS}</style></head><body><main><h1>Bluesky queue preview</h1>
-<p class="sub">{n} posts in posting order: one Day post a day in the evening; add-ons go out around midday the next day, before the following Day post, like on Tumblr. Images are shown exactly as they'll be uploaded, watermark included. Replies in a thread are stacked under their first post.</p>
+<p class="sub">{n} posts with their planned Berlin times ({t.posts_per_day()} Day post(s) a day). Add-ons always go out before the next Day post, like on Tumblr. Images are shown exactly as they'll be uploaded, watermark included. Replies in a thread are stacked under their first post.</p>
 {"".join(cards)}</main></body></html>""")
 print(f"{n} posts -> {OUT}")

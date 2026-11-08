@@ -15,6 +15,9 @@ permissions:
 
 concurrency: repo-writes
 
+env:
+  POSTS_PER_DAY: ${{ vars.POSTS_PER_DAY }}   # Day posts per day, default 1
+
 jobs:
   post:
     runs-on: ubuntu-latest

@@ -134,6 +134,8 @@ TZ = ZoneInfo("Europe/Berlin")
 PEAK_HOURS = 6           # choose the daily hour among this many busiest hours
 DAILY_WINDOW = (12, 23)  # Berlin hours allowed for the daily post
 EXTRA_START = (11, 13)   # first extra of the day goes out in this hour range
+EXTRA_EARLIEST = 7       # extras never go out before this hour
+DAILY_GAP = 3            # min hours between Day posts when posting several a day
 EXTRA_SPACING = (2, 3)   # hours between extras
 EXTRA_BEFORE_DAILY = 2   # extras stop this many hours before the daily post
 DEFAULT_ACTIVITY = {h: (3 if 14 <= h <= 21 else 1) for h in range(24)}  # UTC
@@ -141,6 +143,47 @@ DEFAULT_ACTIVITY = {h: (3 if 14 <= h <= 21 else 1) for h in range(24)}  # UTC
 
 def berlin_now():
     return datetime.datetime.now(datetime.timezone.utc).astimezone(TZ)
+
+
+def posts_per_day():
+    """Day posts per day: repo variable POSTS_PER_DAY (GitHub > Settings >
+    Secrets and variables > Actions > Variables), default 1."""
+    try:
+        return max(1, min(6, int(os.environ.get("POSTS_PER_DAY") or 1)))
+    except ValueError:
+        return 1
+
+
+def todays_slots(day):
+    """Sorted Berlin hours of the Day posts on `day`."""
+    n = posts_per_day()
+    if n == 1:
+        return [todays_slot(day)]
+    activity = dict(DEFAULT_ACTIVITY)
+    if POPULARITY.exists():
+        try:
+            hours = json.loads(POPULARITY.read_text()).get("hours") or {}
+            if hours:
+                activity = {int(h): v for h, v in hours.items()}
+        except ValueError:
+            pass
+    noon = datetime.datetime(day.year, day.month, day.day, 12, tzinfo=TZ)
+    offset = int(noon.utcoffset().total_seconds() // 3600)
+    local = {(h + offset) % 24: v for h, v in activity.items()}
+    allowed = sorted(h for h in local if DAILY_WINDOW[0] <= h <= DAILY_WINDOW[1])
+    rng = random.Random(f"daily-{day.isoformat()}-{n}")
+    for gap in (DAILY_GAP, 2, 1):
+        best = None
+        for _ in range(300):
+            # weighted sample without replacement, busier hours more likely
+            pick = sorted(sorted(allowed, key=lambda h: -rng.random() ** (1 / max(local[h], 1)))[:n])
+            if len(pick) == n and all(b - a >= gap for a, b in zip(pick, pick[1:])):
+                score = sum(local[h] for h in pick)
+                if best is None or score > best[0]:
+                    best = (score, pick)
+        if best:
+            return best[1]
+    return allowed[-n:]
 
 
 def todays_slot(day):
@@ -191,7 +234,10 @@ def load_state():
 
 
 def plan(now=None):
-    """What to post right now: 'extra', 'daily' or None, plus a reason."""
+    """What to post right now: 'extra', 'daily' or None, plus a reason.
+
+    Add-ons always go out before the next Day post, so the order matches
+    Tumblr: a Day post waits until the add-ons before it are out."""
     now = (now or berlin_now()).astimezone(TZ)
     today = now.date().isoformat()
     queue = load_queue()
@@ -200,25 +246,35 @@ def plan(now=None):
     st = load_state()
     waiting = {m["id"] for _, m in queue}
     pending = [i for i in st["pending"] if i in waiting]
-    daily_hour = todays_slot(now.date())
-    if st.get("date") == today:
-        return None, "Daily post already done today."
+    slots = todays_slots(now.date())
+    done = st.get("daily_count", 1) if st.get("date") == today else 0
+    if done >= len(slots):
+        return None, f"All {len(slots)} Day post(s) done today."
+    slot = slots[done]
 
-    # extras queued by an earlier day's Day post go out before today's daily
     if pending:
+        k = len(pending)
         last = datetime.datetime.fromisoformat(st["last_time"]).astimezone(TZ) if st.get("last_time") else None
-        rng = random.Random(f"extra-{today}-{len(pending)}")
         if last and last.date() == now.date():
-            next_hour = last.hour + rng.randint(*EXTRA_SPACING)
+            # spread the rest evenly between the last post and the next Day slot
+            step = max(1, min(EXTRA_SPACING[1], (slot - last.hour) // (k + 1)))
+            next_hour = last.hour + step
         else:
-            next_hour = rng.randint(*EXTRA_START)
-        if next_hour <= daily_hour - EXTRA_BEFORE_DAILY:
-            if now.hour >= next_hour:
-                return "extra", f"Extra due ({next_hour:02d}:00 Berlin slot)."
-            return None, f"Next extra at {next_hour:02d}:00 Berlin, daily at {daily_hour:02d}:00."
-    if now.hour < daily_hour:
-        return None, f"Daily post today at {daily_hour:02d}:00 Berlin."
-    return "daily", f"Daily post due ({daily_hour:02d}:00 Berlin slot)."
+            rng = random.Random(f"extra-{today}-{k}")
+            start = rng.randint(*EXTRA_START)
+            # leave room for all of them, an hour or more apart, before the slot
+            next_hour = max(EXTRA_EARLIEST, min(start, slot - EXTRA_BEFORE_DAILY - (k - 1) * 2, slot - k))
+        if now.hour >= next_hour:
+            return "extra", f"Add-on due ({next_hour:02d}:00 Berlin), {k} before the next Day post."
+        return None, f"Next add-on at {next_hour:02d}:00 Berlin, Day post at {slot:02d}:00 or right after the add-ons."
+    if now.hour < slot:
+        return None, f"Next Day post today at {slot:02d}:00 Berlin ({done + 1} of {len(slots)})."
+    if done and st.get("last_day_time"):
+        # catching up on missed slots: still keep Day posts 2h+ apart
+        last_day = datetime.datetime.fromisoformat(st["last_day_time"]).astimezone(TZ)
+        if now - last_day < datetime.timedelta(hours=2):
+            return None, "Waiting so Day posts stay 2+ hours apart."
+    return "daily", f"Day post due ({slot:02d}:00 Berlin slot, {done + 1} of {len(slots)})."
 
 
 def due():
@@ -527,8 +583,12 @@ def original_ref(client, tumblr_id):
     f = ARCHIVE / tumblr_id / "post.json"
     if tumblr_id not in posted or not f.exists():
         return None
-    # posted before links were saved: find it on the profile by its opening text
-    opening = json.loads(f.read_text())["text"].strip().split("\n")[0][:60].strip()
+    # posted before links were saved: find it on the profile by its opening
+    # text (ignoring the Day number, which Bluesky counts on its own)
+    def norm(t):
+        t = re.sub(r"^\s*day\s*\d+(\s+part\s+\d+)?", "", t or "", flags=re.I)
+        return " ".join(t.split())
+    opening = norm(json.loads(f.read_text())["text"])[:100]
     if not opening:
         return None
     cursor = None
@@ -537,7 +597,7 @@ def original_ref(client, tumblr_id):
                                       filter="posts_no_replies", limit=100)
         for item in feed.feed:
             rec = item.post.record
-            if getattr(rec, "reply", None) is None and (rec.text or "").startswith(opening):
+            if getattr(rec, "reply", None) is None and norm(rec.text).startswith(opening):
                 ref = models.ComAtprotoRepoStrongRef.Main(uri=item.post.uri, cid=item.post.cid)
                 remember(tumblr_id, ref)
                 return ref
@@ -600,6 +660,24 @@ def post_next(kind="auto"):
     first, _, after = text.partition("\n")
     if re.match(r"^\s*day\s*\d+\b", first, re.I):
         header, rest = first.strip(), after.strip()
+    today = berlin_now().date().isoformat()
+    day_no = day_part = None
+    if kind == "daily" and header:
+        # Bluesky's own Day count: +1 only when the calendar day changes; a
+        # second Day post on the same day becomes "Day N part 2", and so on
+        if "day_no" in st:
+            prev_no, prev_date, prev_part = st["day_no"], st.get("day_date"), st.get("day_part", 1)
+        else:  # first run with numbering: one Day post per day so far
+            posted_ids = set(json.loads(STATE.read_text())) if STATE.exists() else set()
+            prev_no = sum(1 for f in ARCHIVE.glob("*/post.json")
+                          if f.parent.name in posted_ids and is_day(json.loads(f.read_text())))
+            prev_date, prev_part = st.get("date"), 1
+        if prev_date == today and prev_no:
+            day_no, day_part = prev_no, prev_part + 1
+        else:
+            day_no, day_part = prev_no + 1, 1
+        label = f"Day {day_no}" + (f" part {day_part}" if day_part > 1 else "")
+        header = re.sub(r"^\s*day\s*\d+", label, header, count=1, flags=re.I)
     chunks = split_text(rest) if rest else [""]
     if header:
         joined = f"{header}\n\n{chunks[0]}".strip()
@@ -647,7 +725,11 @@ def post_next(kind="auto"):
     STATE.write_text(json.dumps(sorted(posted)))
     now = berlin_now()
     if kind == "daily":
+        st["daily_count"] = st.get("daily_count", 1) + 1 if st.get("date") == now.date().isoformat() else 1
         st["date"] = now.date().isoformat()
+        st["last_day_time"] = now.isoformat(timespec="seconds")
+    if day_no is not None:
+        st.update(day_no=day_no, day_part=day_part, day_date=today)
     st.update(id=m["id"], last_time=now.isoformat(timespec="seconds"), pending=pending)
     LAST_POST.write_text(json.dumps(st, indent=2))
     print(f"Posted {kind} {m['id']} as {n} post(s)" + (" quoting the original" if quote else ""))
