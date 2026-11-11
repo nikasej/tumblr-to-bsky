@@ -1,0 +1,40 @@
+name: post-now
+
+# Skip the queue: posts one Tumblr post to Bluesky right away.
+# Actions tab > post-now > Run workflow > paste the Tumblr link (or leave it
+# empty for your newest post with images). It won't be posted again later.
+on:
+  workflow_dispatch:
+    inputs:
+      post:
+        description: "Tumblr post link (empty = your newest post with images)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency: repo-writes
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests atproto==0.0.73 pillow opencv-python-headless numpy
+      - run: python tumblr_to_bsky.py now "$POST"
+        env:
+          POST: ${{ inputs.post }}
+          TUMBLR_BLOG: ${{ secrets.TUMBLR_BLOG }}
+          TUMBLR_API_KEY: ${{ secrets.TUMBLR_API_KEY }}
+          BSKY_HANDLE: ${{ secrets.BSKY_HANDLE }}
+          BSKY_APP_PASSWORD: ${{ secrets.BSKY_APP_PASSWORD }}
+      - name: Save progress
+        run: |
+          git config user.name "bsky-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add archive posted.json last_post.json bsky_posts.json
+          git diff --cached --quiet || (git commit -m "post-now" && git pull --rebase && git push)

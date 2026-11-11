@@ -32,9 +32,7 @@ MAX_IMG_BYTES = 950_000  # Bluesky image limit is ~1MB
 
 
 # ---------- EXPORT ----------
-def export():
-    import requests
-
+def blog_host():
     # accept "name", "name.tumblr.com", "https://name.tumblr.com/",
     # "tumblr.com/name", "@name" etc.
     blog = os.environ["TUMBLR_BLOG"].strip().lower()
@@ -44,79 +42,135 @@ def export():
     blog = blog.split("/")[0]
     if "." not in blog:
         blog += ".tumblr.com"
-    key = os.environ["TUMBLR_API_KEY"].strip()
+    return blog
+
+
+def tumblr_posts(**params):
+    """One page of the blog's published posts: (posts, own blog name)."""
+    import requests
+
+    blog = blog_host()
+    r = requests.get(
+        f"https://api.tumblr.com/v2/blog/{blog}/posts",
+        params={"api_key": os.environ["TUMBLR_API_KEY"].strip(), "npf": "true", **params},
+        timeout=30,
+    )
+    if r.status_code == 404 and "id" in params:
+        return [], ""
+    if r.status_code != 200:
+        try:
+            msg = r.json().get("meta", {}).get("msg") or r.text[:200]
+        except ValueError:
+            msg = r.text[:200]
+        hint = {
+            401: "The API key was rejected. Check TUMBLR_API_KEY.",
+            404: "Blog not found. Check TUMBLR_BLOG (just the blog name is fine). "
+            "If the blog is hidden from logged-out visitors, the API can't see it.",
+        }.get(r.status_code, "")
+        sys.exit(f"Tumblr returned {r.status_code} ({msg}) for blog '{blog}'. {hint}")
+    resp = r.json()["response"]
+    return resp.get("posts", []), (resp.get("blog") or {}).get("name", "").lower()
+
+
+def save_post(p, me):
+    """Archive one Tumblr post if it's yours. Returns its id, or None if it's
+    someone else's reblog or an answered ask."""
+    import requests
+
+    # keep your own originals, plus reblogs of your own posts (those
+    # become quote posts of the original on Bluesky); skip other
+    # people's posts you reblogged and answered asks
+    is_reblog = p.get("trail") or p.get("reblogged_from_id") or p.get("parent_post_url")
+    is_ask = any(l.get("type") == "ask" for l in p.get("layout", []))
+    reblog_of = None
+    if is_reblog:
+        trail = p.get("trail") or [{}]
+        root_blog = ((trail[0].get("blog") or {}).get("name")
+                     or p.get("reblogged_root_name") or "").lower()
+        root_id = str((trail[0].get("post") or {}).get("id")
+                      or p.get("reblogged_root_id") or "")
+        if me and root_blog == me and root_id:
+            reblog_of = root_id
+        else:
+            return None
+    if is_ask:
+        return None
+    pid = str(p["id"])
+    folder = ARCHIVE / pid
+    if (folder / "post.json").exists():
+        return pid
+    folder.mkdir(parents=True, exist_ok=True)
+    text_parts, images = [], []
+    for block in p.get("content", []):
+        if block["type"] == "text":
+            text_parts.append(block["text"])
+        elif block["type"] == "image":
+            url = block["media"][0]["url"]  # largest version first
+            ext = url.split("?")[0].rsplit(".", 1)[-1][:4]
+            name = f"img{len(images) + 1}.{ext}"
+            (folder / name).write_bytes(requests.get(url, timeout=60).content)
+            images.append({"file": name, "alt": block.get("alt_text") or ""})
+    meta = {
+        "id": pid,
+        "timestamp": p["timestamp"],
+        "text": "\n\n".join(text_parts).strip(),
+        "tags": p.get("tags", []),
+        "images": images,
+        "source": p.get("post_url"),
+        "reblog_of": reblog_of,  # Tumblr id of your own post this reblogs
+    }
+    (folder / "post.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False))
+    return pid
+
+
+def export():
     ARCHIVE.mkdir(exist_ok=True)
     offset, saved = 0, 0
     while True:
-        r = requests.get(
-            f"https://api.tumblr.com/v2/blog/{blog}/posts",
-            params={"api_key": key, "npf": "true", "limit": 20, "offset": offset},
-            timeout=30,
-        )
-        if r.status_code != 200:
-            try:
-                msg = r.json().get("meta", {}).get("msg") or r.text[:200]
-            except ValueError:
-                msg = r.text[:200]
-            hint = {
-                401: "The API key was rejected. Check TUMBLR_API_KEY.",
-                404: "Blog not found. Check TUMBLR_BLOG (just the blog name is fine). "
-                "If the blog is hidden from logged-out visitors, the API can't see it.",
-            }.get(r.status_code, "")
-            sys.exit(f"Tumblr returned {r.status_code} ({msg}) for blog '{blog}'. {hint}")
-        resp = r.json()["response"]
-        posts = resp["posts"]
-        me = (resp.get("blog") or {}).get("name", "").lower()
+        posts, me = tumblr_posts(limit=20, offset=offset)
         if not posts:
             break
         for p in posts:
             offset += 1
-            # keep your own originals, plus reblogs of your own posts (those
-            # become quote posts of the original on Bluesky); skip other
-            # people's posts you reblogged and answered asks
-            is_reblog = p.get("trail") or p.get("reblogged_from_id") or p.get("parent_post_url")
-            is_ask = any(l.get("type") == "ask" for l in p.get("layout", []))
-            reblog_of = None
-            if is_reblog:
-                trail = p.get("trail") or [{}]
-                root_blog = ((trail[0].get("blog") or {}).get("name")
-                             or p.get("reblogged_root_name") or "").lower()
-                root_id = str((trail[0].get("post") or {}).get("id")
-                              or p.get("reblogged_root_id") or "")
-                if me and root_blog == me and root_id:
-                    reblog_of = root_id
-                else:
-                    continue
-            if is_ask:
+            if (ARCHIVE / str(p["id"]) / "post.json").exists():
                 continue
-            pid = str(p["id"])
-            folder = ARCHIVE / pid
-            if folder.exists():
-                continue
-            folder.mkdir()
-            text_parts, images = [], []
-            for block in p.get("content", []):
-                if block["type"] == "text":
-                    text_parts.append(block["text"])
-                elif block["type"] == "image":
-                    url = block["media"][0]["url"]  # largest version first
-                    ext = url.split("?")[0].rsplit(".", 1)[-1][:4]
-                    name = f"img{len(images) + 1}.{ext}"
-                    (folder / name).write_bytes(requests.get(url, timeout=60).content)
-                    images.append({"file": name, "alt": block.get("alt_text") or ""})
-            meta = {
-                "id": pid,
-                "timestamp": p["timestamp"],
-                "text": "\n\n".join(text_parts).strip(),
-                "tags": p.get("tags", []),
-                "images": images,
-                "source": p.get("post_url"),
-                "reblog_of": reblog_of,  # Tumblr id of your own post this reblogs
-            }
-            (folder / "post.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False))
-            saved += 1
+            if save_post(p, me):
+                saved += 1
         print(f"...{offset} scanned, {saved} saved")
     print(f"Done. {saved} original posts archived in {ARCHIVE}/")
+
+
+def post_now(ref=""):
+    """Skip the queue: fetch one Tumblr post (link or id; empty = your newest
+    post with images) and post it to Bluesky right away. It's then marked as
+    posted, so it won't come up again later. The Day count isn't touched."""
+    ARCHIVE.mkdir(exist_ok=True)
+    m_id = re.search(r"\d{9,}", ref or "")
+    if m_id:
+        posts, me = tumblr_posts(id=m_id.group(0))
+        if not posts:
+            sys.exit("Tumblr can't find that post. If it's still in your Tumblr queue, "
+                     "run this again once it's published.")
+        pid = save_post(posts[0], me)
+        if not pid:
+            sys.exit("That's a reblog of someone else's post or an ask, so it isn't posted.")
+    else:
+        posts, me = tumblr_posts(limit=20)
+        pid = None
+        for p in posts:
+            got = save_post(p, me)
+            if got and json.loads((ARCHIVE / got / "post.json").read_text())["images"]:
+                pid = got
+                break
+        if not pid:
+            sys.exit("None of your 20 newest Tumblr posts has images.")
+    m = json.loads((ARCHIVE / pid / "post.json").read_text())
+    if pid in (set(json.loads(STATE.read_text())) if STATE.exists() else set()):
+        sys.exit(f"Already on Bluesky: {m['text'][:60]!r}")
+    if not m["images"]:
+        sys.exit("That post has no images. Text-only posts aren't reposted.")
+    print(f"Posting now: {m['text'].split(chr(10))[0][:70]!r}")
+    post_next("now", only_id=pid)
 
 
 # ---------- SCHEDULE ----------
@@ -626,9 +680,10 @@ def send(client, tb, images=(), alts=(), reply_to=None, quote=None):
     return client.send_post(tb, reply_to=reply_to, embed=embed)
 
 
-def post_next(kind="auto"):
-    """Post one item. kind: 'daily', 'extra', or 'auto' (extra if one is
-    pending, else daily; used by the preview)."""
+def post_next(kind="auto", only_id=None):
+    """Post one item. kind: 'daily', 'extra', 'now' (the post `only_id`,
+    outside the schedule), or 'auto' (extra if one is pending, else daily;
+    used by the preview)."""
     from atproto import Client, client_utils, models
 
     queue = load_queue()
@@ -640,7 +695,11 @@ def post_next(kind="auto"):
     pending = [i for i in st["pending"] if i in byid]
     if kind == "auto":
         kind = "extra" if pending else "daily"
-    if kind == "extra" and pending:
+    if kind == "now":
+        if only_id not in byid:
+            sys.exit("That post isn't waiting to be posted (already posted, skipped or text-only).")
+        folder, m = byid[only_id]
+    elif kind == "extra" and pending:
         folder, m = byid[pending.pop(0)]
     else:
         kind = "daily"
@@ -741,6 +800,8 @@ if __name__ == "__main__":
         export()
     elif cmd == "post":
         post_next(sys.argv[2] if len(sys.argv) > 2 else "auto")
+    elif cmd == "now":  # python tumblr_to_bsky.py now [tumblr link or id]
+        post_now(sys.argv[2] if len(sys.argv) > 2 else "")
     elif cmd == "due":
         sys.exit(due())
     elif cmd == "slots":  # show the next week's daily posting hours
@@ -748,4 +809,4 @@ if __name__ == "__main__":
             day = berlin_now().date() + datetime.timedelta(days=d)
             print(day, f"daily post at {todays_slot(day):02d}:xx Berlin")
     else:
-        print("Usage: python tumblr_to_bsky.py [export|post|due|slots]")
+        print("Usage: python tumblr_to_bsky.py [export|post|now|due|slots]")
