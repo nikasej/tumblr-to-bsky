@@ -16,7 +16,7 @@ permissions:
 concurrency: repo-writes
 
 env:
-  POSTS_PER_DAY: ${{ vars.POSTS_PER_DAY }}   # Day posts per day, default 1
+  POSTS_PER_DAY: "1"   # Day posts per day (set to 2+ for "Day N part 2" days)
 
 jobs:
   post:
