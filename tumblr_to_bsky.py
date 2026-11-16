@@ -737,13 +737,24 @@ def post_next(kind="auto", only_id=None):
             day_no, day_part = prev_no + 1, 1
         label = f"Day {day_no}" + (f" part {day_part}" if day_part > 1 else "")
         header = re.sub(r"^\s*day\s*\d+", label, header, count=1, flags=re.I)
-    chunks = split_text(rest) if rest else [""]
-    if header:
-        joined = f"{header}\n\n{chunks[0]}".strip()
-        if len(joined) <= MAX_CHARS - 10:
-            chunks[0] = joined
-        else:  # header gets the first post to itself
-            chunks.insert(0, header)
+    # hashtags go on the FIRST post, next to the images: hashtag feeds and
+    # search match single posts, and art feeds usually skip replies and
+    # posts without images, so tags on a later reply would barely be seen
+    tags = bsky_tags(m["tags"], m["text"])
+    head = f"{header}\n\n" if header else ""
+    while True:
+        reserve = len(head) + (len(" ".join("#" + t for t in tags)) + 1 if tags else 0)
+        first_limit = MAX_CHARS - 10 - reserve
+        if first_limit >= 80 or len(tags) <= 1:
+            break
+        tags = tags[:-1]  # drop the least important tag rather than squeeze the caption
+    if not rest:
+        chunks = [head.strip()]
+    elif len(rest) <= first_limit:
+        chunks = [head + rest]
+    else:
+        pieces = split_text(rest, max(first_limit, 40))
+        chunks = [head + pieces[0]] + split_text("\n\n".join(pieces[1:]))
     # Bluesky allows 4 images per post: spread groups of 4 over the thread,
     # adding image-only replies if there are more groups than text chunks
     groups = [m["images"][k : k + 4] for k in range(0, len(m["images"]), 4)]
@@ -757,12 +768,13 @@ def post_next(kind="auto", only_id=None):
     for i, chunk in enumerate(chunks):
         label = f" {i + 1}/{n}" if n > 1 else ""
         tb = client_utils.TextBuilder()
-        tb.text((chunk + label).strip())
-        if i == n - 1:  # hashtags go on the last post if they fit
-            used = len(chunk + label)
-            for tag in bsky_tags(m["tags"], m["text"]):
+        body = (chunk + label).strip()
+        tb.text(body)
+        if i == 0:
+            used = len(body)
+            for tag in tags:
                 if tag and used + len(tag) + 2 <= MAX_CHARS:
-                    tb.text("\n" if used == len(chunk + label) else " ")
+                    tb.text("\n" if used == len(body) else " ")
                     tb.tag(f"#{tag}", tag)
                     used += len(tag) + 2
         reply_to = (
