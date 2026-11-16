@@ -2,7 +2,9 @@ name: daily-bluesky-post
 
 on:
   schedule:
-    - cron: "17 * * * *"   # checks hourly: one Day post a day at a varying peak hour, extras earlier
+    - cron: "17 * * * *"     # checks hourly: one Day post a day at a varying peak hour, extras earlier
+    - cron: "47 10-22 * * *" # extra half-hour checks ~midday to midnight Berlin, when posts go out
+                             # (GitHub often skips scheduled runs; this makes late posts less likely)
   workflow_dispatch:
     inputs:
       force:
