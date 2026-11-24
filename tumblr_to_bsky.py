@@ -736,7 +736,15 @@ def post_next(kind="auto", only_id=None):
         else:
             day_no, day_part = prev_no + 1, 1
         label = f"Day {day_no}" + (f" part {day_part}" if day_part > 1 else "")
+        tumblr_no = int(re.match(r"^\s*day\s*(\d+)", header, re.I).group(1))
         header = re.sub(r"^\s*day\s*\d+", label, header, count=1, flags=re.I)
+        st.setdefault("day_map", {})[str(tumblr_no)] = day_no
+        # captions mention the Tumblr count ("we hit 20 days!"): use Bluesky's
+        rest = re.sub(rf"\b{tumblr_no}(\s*days?)\b", lambda x: f"{day_no}{x.group(1)}", rest, flags=re.I)
+    # "day 12" anywhere in a caption -> the Bluesky number that Day post got
+    day_map = st.get("day_map", {})
+    rest = re.sub(r"\b(day\s*)(\d+)\b",
+                  lambda x: x.group(1) + str(day_map.get(x.group(2), x.group(2))), rest, flags=re.I)
     # hashtags go on the FIRST post, next to the images: hashtag feeds and
     # search match single posts, and art feeds usually skip replies and
     # posts without images, so tags on a later reply would barely be seen
